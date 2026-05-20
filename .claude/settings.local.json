@@ -8,7 +8,9 @@
       "Bash(cargo test *)",
       "Bash(timeout 8 ./target/debug/gaterminal)",
       "Bash(echo \"exit: $?\")",
-      "Read(//private/tmp/**)"
+      "Read(//private/tmp/**)",
+      "Bash(timeout 6 ./target/debug/gaterminal)",
+      "Bash(echo \"smoke exit: $?\")"
     ]
   }
 }

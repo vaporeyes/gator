@@ -24,9 +24,17 @@ pub struct StateMutator<'a> {
 }
 
 impl<'a> Perform for StateMutator<'a> {
-    /// Standard printable character insertion.
+    /// Standard printable character insertion. Dispatches by Unicode display
+    /// width so wide codepoints occupy two cells and combining marks attach
+    /// to the previous cell instead of advancing the cursor.
     fn print(&mut self, c: char) {
-        self.grid.write_char(self.cursor, c);
+        use unicode_width::UnicodeWidthChar;
+        match UnicodeWidthChar::width(c) {
+            Some(0) => self.grid.attach_combining(self.cursor, c),
+            Some(2) => self.grid.write_wide(self.cursor, c),
+            // Width 1 (most printable), or None (control); print as a single cell.
+            _ => self.grid.write_char(self.cursor, c),
+        }
     }
 
     /// C0 control characters (e.g., \n, \r, \b).
@@ -34,6 +42,7 @@ impl<'a> Perform for StateMutator<'a> {
         match byte {
             b'\n' => self.grid.line_feed(self.cursor),
             b'\r' => self.cursor.col = 0,
+            0x07 => self.grid.ring_bell(),
             0x08 => self.cursor.backspace(),
             b'\t' => {
                 // Advance to the next 8-column tab stop.
@@ -109,6 +118,9 @@ impl<'a> Perform for StateMutator<'a> {
                             }
                         }
                         2004 => self.grid.bracketed_paste = set,
+                        1000 => self.grid.mouse_mode.button = set,    // basic mouse
+                        1002 => self.grid.mouse_mode.drag = set,      // + drag tracking
+                        1006 => self.grid.mouse_mode.sgr_encoded = set, // SGR encoding
                         _ => {}
                     }
                 }
@@ -129,12 +141,64 @@ impl<'a> Perform for StateMutator<'a> {
             'u' if intermediates.is_empty() => self.cursor.restore(), // DECRC
             'L' => self.grid.insert_lines(self.cursor, param1(params, 1)), // IL
             'M' => self.grid.delete_lines(self.cursor, param1(params, 1)), // DL
+            'q' if intermediates.first() == Some(&b' ') => {
+                // DECSCUSR: CSI Ps SP q. Ps = 0..6 set shape + blink.
+                use crate::grid::CursorStyle;
+                let ps = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let (style, blink) = match ps {
+                    0 | 1 => (CursorStyle::Block, true),
+                    2 => (CursorStyle::Block, false),
+                    3 => (CursorStyle::Underline, true),
+                    4 => (CursorStyle::Underline, false),
+                    5 => (CursorStyle::Bar, true),
+                    6 => (CursorStyle::Bar, false),
+                    _ => return,
+                };
+                self.cursor.style = style;
+                self.cursor.blink = blink;
+            }
             _ => {} // Unimplemented CSI
         }
     }
 
-    // Stubbed required trait methods: osc_dispatch, hook, put, unhook.
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.is_empty() {
+            return;
+        }
+        // OSC code is the first parameter, as decimal ASCII.
+        let code = std::str::from_utf8(params[0])
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        match code {
+            // Window/icon title: OSC 0;..., OSC 1;..., OSC 2;...
+            Some(0) | Some(1) | Some(2) => {
+                if let Some(bytes) = params.get(1) {
+                    self.grid.title = String::from_utf8_lossy(bytes).into_owned();
+                    self.grid.title_seq = self.grid.title_seq.wrapping_add(1);
+                }
+            }
+            // OSC 8 ; params ; URL ST  -> set/clear active hyperlink.
+            Some(8) => {
+                let url = params.get(2).map(|b| String::from_utf8_lossy(b).into_owned());
+                self.grid.active_link = match url {
+                    Some(u) if !u.is_empty() => Some(u),
+                    _ => None,
+                };
+            }
+            // OSC 52 ; <selection> ; <base64> -> system clipboard.
+            Some(52) => {
+                if let Some(payload) = params.get(2) {
+                    use base64::Engine;
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) {
+                        if let Ok(text) = String::from_utf8(bytes) {
+                            self.grid.pending_clipboard = Some(text);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     /// ESC-sequence dispatch: cursor save/restore and the index operations.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -346,5 +410,186 @@ mod tests {
     fn bracketed_paste_mode_tracked() {
         assert!(drive(10, 2, b"\x1b[?2004h").0.bracketed_paste);
         assert!(!drive(10, 2, b"\x1b[?2004h\x1b[?2004l").0.bracketed_paste);
+    }
+
+    #[test]
+    fn mouse_modes_track_dec_set_reset() {
+        let (g, _) = drive(10, 2, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert!(g.mouse_mode.button);
+        assert!(g.mouse_mode.drag);
+        assert!(g.mouse_mode.sgr_encoded);
+        assert!(g.mouse_mode.enabled());
+        let (g, _) = drive(10, 2, b"\x1b[?1000h\x1b[?1000l");
+        assert!(!g.mouse_mode.button);
+        assert!(!g.mouse_mode.enabled());
+    }
+
+    #[test]
+    fn brighten_palette_color_maps_basic_to_bright() {
+        use crate::grid::{brighten_palette_color, ANSI_PALETTE};
+        // The eight basic colors map to indices i + 8.
+        for i in 0..8 {
+            assert_eq!(brighten_palette_color(ANSI_PALETTE[i]), ANSI_PALETTE[i + 8]);
+        }
+        // A non-palette color (e.g., truecolor) is unchanged.
+        assert_eq!(brighten_palette_color(0xABCDEF), 0xABCDEF);
+        // Bright palette colors are also non-basic (no double-brighten).
+        assert_eq!(brighten_palette_color(ANSI_PALETTE[12]), ANSI_PALETTE[12]);
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells_with_flags() {
+        use crate::grid::{ATTR_WIDE, ATTR_WIDE_TRAILING};
+        // "中" (U+4E2D) is width 2.
+        let (g, c) = drive(4, 2, b"\xe4\xb8\xad");
+        let v = g.viewport();
+        assert_ne!(v[0].flags & ATTR_WIDE, 0);
+        assert_ne!(v[1].flags & ATTR_WIDE_TRAILING, 0);
+        assert_eq!(v[0].c, '\u{4E2D}');
+        // Cursor advanced by 2 columns.
+        assert_eq!(c.col, 2);
+    }
+
+    #[test]
+    fn combining_attaches_to_previous_cell() {
+        // 'e' (width 1) then U+0301 combining acute (width 0).
+        // UTF-8: 'e' = 0x65 ; U+0301 = 0xCC 0x81
+        let (g, c) = drive(4, 2, b"e\xcc\x81");
+        let v = g.viewport();
+        assert_eq!(v[0].c, 'e');
+        assert_ne!(v[0].combining_id, 0);
+        assert_eq!(g.cluster_string(&v[0]), "e\u{0301}");
+        assert_eq!(c.col, 1);
+    }
+
+    #[test]
+    fn selection_skips_wide_trailing_and_keeps_clusters() {
+        use crate::grid::{AbsCoord, Selection};
+        // "中e" + combining acute. Width sum: 2 + 1 + 0 = 3 cells (0,1,2);
+        // cell 0 is wide leading, cell 1 wide trailing, cell 2 is 'e' with
+        // combining. Selecting cols 0..=2 should yield "中é" (3 chars).
+        let (g, _) = drive(6, 2, b"\xe4\xb8\xade\xcc\x81");
+        let sel = Selection {
+            anchor: AbsCoord { abs_row: 0, col: 0 },
+            head: AbsCoord { abs_row: 0, col: 2 },
+        };
+        assert_eq!(g.get_selection_text(sel), "\u{4E2D}e\u{0301}");
+    }
+
+    #[test]
+    fn osc_0_sets_window_title() {
+        let (g, _) = drive(20, 2, b"\x1b]0;hello world\x07");
+        assert_eq!(g.title, "hello world");
+        assert_eq!(g.title_seq, 1);
+    }
+
+    #[test]
+    fn osc_52_decodes_clipboard() {
+        // "hello" -> base64 "aGVsbG8="
+        let (g, _) = drive(10, 2, b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(g.pending_clipboard.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn osc_8_link_attaches_to_cells() {
+        let (g, _) = drive(20, 2, b"\x1b]8;;https://a.example\x07X\x1b]8;;\x07Y");
+        // 'X' is written under the active link at (abs_row 0, col 0);
+        // 'Y' is written after the link was closed and should have none.
+        assert_eq!(
+            g.hyperlinks.get(&(0, 0)).map(String::as_str),
+            Some("https://a.example")
+        );
+        assert!(g.hyperlinks.get(&(0, 1)).is_none());
+    }
+
+    #[test]
+    fn bel_increments_bell_seq() {
+        let (g, _) = drive(4, 2, b"\x07hi\x07");
+        assert_eq!(g.bell_seq, 2);
+    }
+
+    #[test]
+    fn decscusr_sets_style_and_blink() {
+        use crate::grid::CursorStyle;
+        let (_, c) = drive(4, 2, b"\x1b[3 q");
+        assert_eq!(c.style, CursorStyle::Underline);
+        assert!(c.blink);
+        let (_, c) = drive(4, 2, b"\x1b[2 q");
+        assert_eq!(c.style, CursorStyle::Block);
+        assert!(!c.blink);
+        let (_, c) = drive(4, 2, b"\x1b[6 q");
+        assert_eq!(c.style, CursorStyle::Bar);
+        assert!(!c.blink);
+    }
+
+    #[test]
+    fn selection_within_one_row_extracts_substring() {
+        use crate::grid::{AbsCoord, Selection};
+        let (g, _) = drive(20, 2, b"hello world");
+        // Empty scrollback -> viewport row 0 has absolute row 0.
+        let sel = Selection {
+            anchor: AbsCoord { abs_row: 0, col: 6 },
+            head: AbsCoord { abs_row: 0, col: 10 },
+        };
+        assert_eq!(g.get_selection_text(sel), "world");
+    }
+
+    #[test]
+    fn pending_log_records_evicted_lines_only_on_primary_full_screen() {
+        // 4 cols, 2 rows; print enough to scroll once.
+        let (mut g, _) = drive(4, 2, b"aaa\r\nbbb\r\nccc");
+        // Two newlines past row 0 cause one scroll => one pending_log entry.
+        assert_eq!(g.pending_log.len(), 1);
+        assert_eq!(
+            g.pending_log[0].iter().map(|c| c.c).collect::<String>().trim_end(),
+            "aaa"
+        );
+        // Alt screen scrolls do not feed pending_log.
+        g.pending_log.clear();
+        let (g2, _) = drive(4, 2, b"\x1b[?1049hX\r\nY\r\nZ");
+        assert!(g2.pending_log.is_empty());
+    }
+
+    #[test]
+    fn scroll_lines_clamps_and_at_bottom_resets() {
+        use crate::grid::Grid;
+        let mut g = Grid::new(4, 2, 100);
+        g.push_history_line(vec![crate::grid::Cell::default(); 4]);
+        g.push_history_line(vec![crate::grid::Cell::default(); 4]);
+        assert!(g.at_bottom());
+        g.scroll_lines(5);
+        assert_eq!(g.view_offset, 2); // clamped to scrollback.len()
+        assert!(!g.at_bottom());
+        g.scroll_lines(-10);
+        assert!(g.at_bottom());
+    }
+
+    #[test]
+    fn scrolling_disabled_on_alt_screen() {
+        let (mut g, _) = drive(4, 2, b"\x1b[?1049h");
+        g.scroll_lines(10);
+        assert!(g.at_bottom());
+    }
+
+    #[test]
+    fn display_row_pulls_from_scrollback_when_scrolled() {
+        // Push three logical lines through scrolling, then scroll view up by 2.
+        let (mut g, _) = drive(4, 2, b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        g.scroll_lines(2);
+        // Top-of-view row 0 should be scrollback's oldest (AAA).
+        let top: String = g.display_row(0).iter().map(|c| c.c).collect();
+        assert_eq!(top.trim_end(), "AAA");
+    }
+
+    #[test]
+    fn selection_spans_two_rows_strips_trailing_spaces() {
+        use crate::grid::{AbsCoord, Selection};
+        let (g, _) = drive(10, 3, b"abc\r\nXYZ");
+        // anchor row1 col1 -> head row0 col1 (reversed). Normalized is row0..row1.
+        let sel = Selection {
+            anchor: AbsCoord { abs_row: 1, col: 1 },
+            head: AbsCoord { abs_row: 0, col: 1 },
+        };
+        assert_eq!(g.get_selection_text(sel), "bc\nXY");
     }
 }

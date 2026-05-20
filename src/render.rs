@@ -1,8 +1,12 @@
 // ABOUTME: Phase 4 rendering: Renderer trait, dirty-cell FrameDiff, crossterm backend.
 // ABOUTME: Draw calls are batched via crossterm's queue and flushed once per frame.
 
-use crate::grid::{Cell, CursorState, Grid, ATTR_BOLD, ATTR_ITALIC, ATTR_UNDERLINE};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crate::grid::{
+    Cell, CursorState, Grid, ATTR_BOLD, ATTR_ITALIC, ATTR_UNDERLINE, ATTR_WIDE_TRAILING,
+};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 use std::io::{Stdout, Write};
@@ -42,28 +46,25 @@ impl FrameDiff {
         self.previous_viewport = vec![sentinel; cols * rows];
     }
 
-    /// Yields only the cells that have mutated since the last render pass.
-    pub fn calculate_diff<'a>(
-        &'a mut self,
-        current_grid: &'a Grid,
-    ) -> impl Iterator<Item = (usize, usize, &'a Cell)> {
-        let cols = current_grid.cols();
-
-        current_grid
-            .viewport()
-            .iter()
-            .zip(self.previous_viewport.iter_mut())
-            .enumerate()
-            .filter_map(move |(idx, (curr, prev))| {
-                if curr != prev {
-                    *prev = *curr; // Update diff buffer inline
-                    let x = idx % cols;
-                    let y = idx / cols;
-                    Some((x, y, curr))
-                } else {
-                    None
+    /// Cells that have mutated since the last render pass, sourced from
+    /// `Grid::display_row` so a scrolled-up view paints scrollback rows.
+    pub fn calculate_diff(&mut self, grid: &Grid) -> Vec<(usize, usize, Cell)> {
+        let cols = grid.cols();
+        let rows = grid.rows();
+        let mut dirty: Vec<(usize, usize, Cell)> = Vec::new();
+        for y in 0..rows {
+            let row = grid.display_row(y);
+            for (x, cell) in row.iter().enumerate() {
+                let idx = y * cols + x;
+                if let Some(prev) = self.previous_viewport.get_mut(idx) {
+                    if cell != prev {
+                        *prev = *cell;
+                        dirty.push((x, y, *cell));
+                    }
                 }
-            })
+            }
+        }
+        dirty
     }
 
     /// Force a single cell to repaint next frame (used for cursor invalidation).
@@ -87,6 +88,7 @@ pub struct CrosstermRenderer {
     cols: usize,
     rows: usize,
     last_cursor: Option<(usize, usize)>,
+    bold_is_bright: bool,
 }
 
 impl CrosstermRenderer {
@@ -97,7 +99,12 @@ impl CrosstermRenderer {
             cols,
             rows,
             last_cursor: None,
+            bold_is_bright: true,
         }
+    }
+
+    pub fn set_bold_is_bright(&mut self, on: bool) {
+        self.bold_is_bright = on;
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -117,8 +124,22 @@ fn to_color(rgb: u32) -> Color {
 }
 
 /// Queue the draw for one cell at (x, y). `inverse` swaps fg/bg for the cursor.
-fn draw_cell(out: &mut Stdout, x: usize, y: usize, cell: &Cell, inverse: bool) -> std::io::Result<()> {
-    let (fg, bg) = if inverse { (cell.bg, cell.fg) } else { (cell.fg, cell.bg) };
+/// `cluster` is the cell's grapheme-cluster string (base + combining marks).
+fn draw_cell(
+    out: &mut Stdout,
+    x: usize,
+    y: usize,
+    cell: &Cell,
+    cluster: &str,
+    inverse: bool,
+    bold_is_bright: bool,
+) -> std::io::Result<()> {
+    // Bold-as-bright on the foreground only, to keep parity with the GPU path.
+    let mut fg = cell.fg;
+    if bold_is_bright && cell.flags & ATTR_BOLD != 0 {
+        fg = crate::grid::brighten_palette_color(fg);
+    }
+    let (fg, bg) = if inverse { (cell.bg, fg) } else { (fg, cell.bg) };
     queue!(
         out,
         cursor::MoveTo(x as u16, y as u16),
@@ -127,7 +148,7 @@ fn draw_cell(out: &mut Stdout, x: usize, y: usize, cell: &Cell, inverse: bool) -
         SetAttribute(if cell.flags & ATTR_BOLD != 0 { Attribute::Bold } else { Attribute::NormalIntensity }),
         SetAttribute(if cell.flags & ATTR_ITALIC != 0 { Attribute::Italic } else { Attribute::NoItalic }),
         SetAttribute(if cell.flags & ATTR_UNDERLINE != 0 { Attribute::Underlined } else { Attribute::NoUnderline }),
-        Print(cell.c),
+        Print(cluster),
     )
 }
 
@@ -141,6 +162,7 @@ impl Renderer for CrosstermRenderer {
             terminal::EnterAlternateScreen,
             terminal::Clear(terminal::ClearType::All),
             EnableBracketedPaste,
+            EnableMouseCapture,
             cursor::Hide
         )?;
         self.out.flush()?;
@@ -169,15 +191,25 @@ impl Renderer for CrosstermRenderer {
 
         // Snapshot dirty cells first so the immutable grid borrow ends before
         // we take the mutable stdout borrow for drawing.
-        let dirty: Vec<(usize, usize, Cell)> = self
-            .diff
-            .calculate_diff(grid)
-            .map(|(x, y, c)| (x, y, *c))
-            .collect();
+        let dirty: Vec<(usize, usize, Cell)> = self.diff.calculate_diff(grid);
 
         for (x, y, cell) in &dirty {
+            // Wide-trailing cells contribute no glyph; the terminal advanced
+            // the cursor by 2 when it received the leading wide character.
+            if cell.flags & ATTR_WIDE_TRAILING != 0 {
+                continue;
+            }
+            let cluster = grid.cluster_string(cell);
             let is_cursor = new_cursor == Some((*x, *y));
-            draw_cell(&mut self.out, *x, *y, cell, is_cursor)?;
+            draw_cell(
+                &mut self.out,
+                *x,
+                *y,
+                cell,
+                &cluster,
+                is_cursor,
+                self.bold_is_bright,
+            )?;
         }
 
         self.out.flush()?;
@@ -188,6 +220,7 @@ impl Renderer for CrosstermRenderer {
     fn shutdown(&mut self) -> Result<(), Self::Error> {
         queue!(
             self.out,
+            DisableMouseCapture,
             DisableBracketedPaste,
             cursor::Show,
             terminal::LeaveAlternateScreen

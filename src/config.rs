@@ -13,6 +13,9 @@ pub struct Config {
     pub font: FontConfig,
     pub colors: ColorConfig,
     pub window: WindowConfig,
+    pub session: SessionConfig,
+    pub effects: EffectsConfig,
+    pub chrome: ChromeConfig,
 }
 
 impl Default for Config {
@@ -23,8 +26,86 @@ impl Default for Config {
             font: FontConfig::default(),
             colors: ColorConfig::default(),
             window: WindowConfig::default(),
+            session: SessionConfig::default(),
+            effects: EffectsConfig::default(),
+            chrome: ChromeConfig::default(),
         }
     }
+}
+
+/// Window chrome and visible-but-not-content settings.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChromeConfig {
+    /// Flash the screen briefly when the app rings the bell (BEL = 0x07).
+    pub visual_bell: bool,
+    /// Padding (logical px) between the window edge and the cell grid.
+    pub padding: u32,
+}
+
+impl Default for ChromeConfig {
+    fn default() -> Self {
+        Self { visual_bell: true, padding: 0 }
+    }
+}
+
+/// Compiz-style post-process effects. All default off so the terminal feels
+/// normal unless the user opts in. Enabling any of these forces the GPU
+/// pipeline into its two-pass mode (off-screen render then effect shader).
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+pub struct EffectsConfig {
+    /// CRT barrel curvature + scanlines (persistent).
+    pub crt: bool,
+    /// Expanding ring flash centered on each keystroke (animated, ~400ms).
+    pub keystroke: bool,
+    /// Brief sinusoidal wobble triggered by window resize (~600ms).
+    pub wobble: bool,
+    /// Page-turn squeeze triggered by alt-screen toggle (~300ms).
+    pub cube: bool,
+}
+
+impl EffectsConfig {
+    pub fn any(&self) -> bool {
+        self.crt || self.keystroke || self.wobble || self.cube
+    }
+}
+
+/// History/session storage. All three are independently opt-in.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Raw byte-for-byte session log (one file per launch). Empty = off.
+    /// Supports `~` and `{ts}` (unix seconds) substitutions.
+    pub raw_log: String,
+    /// Plain-text scrollback log (append). Empty = off.
+    pub text_log: String,
+    /// On startup, preload this many lines from text_log into scrollback.
+    /// 0 = no restore. Requires text_log to be set.
+    pub restore_lines: usize,
+}
+
+/// `~` -> $HOME, `{ts}` -> seconds-since-epoch as integer.
+pub fn expand_path(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/{rest}")
+    } else if s == "~" {
+        std::env::var("HOME").unwrap_or_default()
+    } else {
+        s.to_string()
+    };
+    if out.contains("{ts}") {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out = out.replace("{ts}", &ts.to_string());
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,11 +129,20 @@ impl Default for FontConfig {
 pub struct ColorConfig {
     pub foreground: HexColor,
     pub background: HexColor,
+    /// Apply the "bold = bright" convention: when an SGR-bold cell uses one
+    /// of the 8 basic palette colors, map it to the bright counterpart so
+    /// dark navy / dark green prompts and `ls --color` directories don't
+    /// disappear on a dark background.
+    pub bold_is_bright: bool,
 }
 
 impl Default for ColorConfig {
     fn default() -> Self {
-        Self { foreground: HexColor(0xFFFFFF), background: HexColor(0x000000) }
+        Self {
+            foreground: HexColor(0xFFFFFF),
+            background: HexColor(0x000000),
+            bold_is_bright: true,
+        }
     }
 }
 
@@ -173,5 +263,57 @@ mod tests {
     #[test]
     fn unknown_key_is_rejected() {
         assert!(toml::from_str::<Config>("definitely_not_a_key = 1").is_err());
+    }
+
+    #[test]
+    fn session_block_defaults_off() {
+        let c = Config::default();
+        assert!(c.session.raw_log.is_empty());
+        assert!(c.session.text_log.is_empty());
+        assert_eq!(c.session.restore_lines, 0);
+    }
+
+    #[test]
+    fn session_block_parses() {
+        let c: Config = toml::from_str(
+            r#"
+            [session]
+            raw_log = "~/raw/{ts}.log"
+            text_log = "~/history.log"
+            restore_lines = 500
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.session.raw_log, "~/raw/{ts}.log");
+        assert_eq!(c.session.text_log, "~/history.log");
+        assert_eq!(c.session.restore_lines, 500);
+    }
+
+    #[test]
+    fn effects_default_off_and_parse() {
+        let c = Config::default();
+        assert!(!c.effects.any());
+        let c: Config = toml::from_str(
+            r#"
+            [effects]
+            crt = true
+            keystroke = true
+            "#,
+        )
+        .unwrap();
+        assert!(c.effects.crt && c.effects.keystroke);
+        assert!(!c.effects.wobble && !c.effects.cube);
+        assert!(c.effects.any());
+    }
+
+    #[test]
+    fn expand_path_substitutes_home_and_ts() {
+        std::env::set_var("HOME", "/tmp/h");
+        let p = expand_path("~/sub/{ts}.log");
+        assert!(p.starts_with("/tmp/h/sub/"));
+        assert!(p.ends_with(".log"));
+        // {ts} replaced by digits.
+        let body = &p["/tmp/h/sub/".len()..p.len() - ".log".len()];
+        assert!(body.chars().all(|c| c.is_ascii_digit()));
     }
 }

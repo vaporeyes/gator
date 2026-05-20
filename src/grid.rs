@@ -8,21 +8,29 @@ use vte::Params;
 pub const ATTR_BOLD: u16 = 1 << 0;
 pub const ATTR_ITALIC: u16 = 1 << 1;
 pub const ATTR_UNDERLINE: u16 = 1 << 2;
+/// Leading half of a double-width cell (CJK, fullwidth forms). The next cell
+/// has `ATTR_WIDE_TRAILING` and is occupied by this glyph's right half.
+pub const ATTR_WIDE: u16 = 1 << 3;
+/// Right half of a double-width cell. Renderers skip drawing its glyph;
+/// selection text extraction ignores it.
+pub const ATTR_WIDE_TRAILING: u16 = 1 << 4;
 
 /// Optimized to 16 bytes for strict cache alignment.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct Cell {
-    pub c: char,       // 4 bytes
-    pub fg: u32,       // 4 bytes (0x00RRGGBB)
-    pub bg: u32,       // 4 bytes (0x00RRGGBB)
-    pub flags: u16,    // 2 bytes
-    pub _padding: u16, // 2 bytes (alignment)
+    pub c: char,            // 4 bytes
+    pub fg: u32,            // 4 bytes (0x00RRGGBB)
+    pub bg: u32,            // 4 bytes (0x00RRGGBB)
+    pub flags: u16,         // 2 bytes
+    /// Index into `Grid::combining_pool` for zero-width chars attached to
+    /// this cell. `0` is the reserved "no extras" sentinel.
+    pub combining_id: u16,  // 2 bytes
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { c: ' ', fg: 0xFFFFFF, bg: 0x000000, flags: 0, _padding: 0 }
+        Cell { c: ' ', fg: 0xFFFFFF, bg: 0x000000, flags: 0, combining_id: 0 }
     }
 }
 
@@ -34,6 +42,20 @@ struct SavedCursor {
     pen: Cell,
 }
 
+/// DECSCUSR cursor shape (`CSI Ps SP q`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStyle {
+    Block,
+    Underline,
+    Bar,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
 /// Cursor position and the active pen carried into newly written cells.
 #[derive(Debug)]
 pub struct CursorState {
@@ -43,12 +65,24 @@ pub struct CursorState {
     pub pen: Cell,
     /// DECTCEM (`CSI ?25 h/l`): whether the cursor block is drawn.
     pub visible: bool,
+    /// DECSCUSR shape.
+    pub style: CursorStyle,
+    /// DECSCUSR blink flag. Renderer interprets together with a clock.
+    pub blink: bool,
     saved: Option<SavedCursor>,
 }
 
 impl CursorState {
     pub fn new() -> Self {
-        Self { row: 0, col: 0, pen: Cell::default(), visible: true, saved: None }
+        Self {
+            row: 0,
+            col: 0,
+            pen: Cell::default(),
+            visible: true,
+            style: CursorStyle::Block,
+            blink: false,
+            saved: None,
+        }
     }
 
     /// DECSC: save position + pen.
@@ -100,6 +134,88 @@ pub struct Grid {
     saved_primary: Option<Vec<Cell>>,
     /// `CSI ?2004 h/l`: orchestrator wraps pasted text in ESC[200~/201~.
     pub bracketed_paste: bool,
+    /// DEC mouse-reporting modes (`?1000`/`?1002`/`?1006`).
+    pub mouse_mode: MouseMode,
+    /// Active text selection in absolute-row coords (anchor + floating head).
+    pub selection: Option<Selection>,
+    /// Monotonic counter incremented on each BEL (`0x07`). The orchestrator
+    /// records the value once per parse pass; an increment triggers the
+    /// visual-bell flash (when `[chrome] visual_bell = true`).
+    pub bell_seq: u64,
+    /// Last `OSC 0`/`OSC 2` window-title string (UTF-8) and a monotonic
+    /// counter; the orchestrator pushes the title to the window when seq bumps.
+    pub title: String,
+    pub title_seq: u64,
+    /// Last `OSC 52` clipboard payload waiting to be copied to the OS clipboard.
+    /// Drained by the orchestrator each tick.
+    pub pending_clipboard: Option<String>,
+    /// Active `OSC 8` hyperlink applied to subsequent `print` writes.
+    pub active_link: Option<String>,
+    /// Sparse map of `(absolute row, col)` -> URL for OSC 8 hyperlinks.
+    pub hyperlinks: std::collections::HashMap<(usize, usize), String>,
+    /// Interned combining-mark sequences. Index 0 is reserved as the empty
+    /// "no extras" sentinel so a fresh `Cell` (combining_id = 0) means
+    /// "single codepoint". Cells with combining marks point at later slots.
+    combining_pool: Vec<Vec<char>>,
+    combining_index: std::collections::HashMap<Vec<char>, u16>,
+    /// Lines pushed into scrollback since the orchestrator last drained.
+    /// The orchestrator writes these to the plain-text session log (if any)
+    /// and uses the count to keep `view_offset` anchored on growth.
+    pub pending_log: Vec<Vec<Cell>>,
+    /// Rows the live view is scrolled up from the bottom (0 = at bottom).
+    /// Always 0 while the alternate screen is active.
+    pub view_offset: usize,
+}
+
+/// DEC mouse-reporting modes the child app has enabled.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MouseMode {
+    /// `?1000`: report press and release.
+    pub button: bool,
+    /// `?1002`: also report drag while a button is held.
+    pub drag: bool,
+    /// `?1006`: SGR-encoded reports (`\x1b[<b;c;rM`/`m`), else X10 fallback.
+    pub sgr_encoded: bool,
+}
+
+impl MouseMode {
+    pub fn enabled(&self) -> bool {
+        self.button || self.drag
+    }
+}
+
+/// A row in either scrollback (0..scrollback.len()) or the viewport above.
+/// Absolute indexing keeps selections stable as new lines scroll in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsCoord {
+    pub abs_row: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    pub anchor: AbsCoord,
+    pub head: AbsCoord,
+}
+
+impl Selection {
+    pub fn new(at: AbsCoord) -> Self {
+        Self { anchor: at, head: at }
+    }
+
+    /// Reading-order (top-left, bottom-right) range. Both ends inclusive.
+    pub fn normalized(&self) -> (AbsCoord, AbsCoord) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn contains(&self, p: AbsCoord) -> bool {
+        let (a, b) = self.normalized();
+        p >= a && p <= b
+    }
 }
 
 impl Grid {
@@ -116,7 +232,122 @@ impl Grid {
             alt_active: false,
             saved_primary: None,
             bracketed_paste: false,
+            mouse_mode: MouseMode::default(),
+            selection: None,
+            bell_seq: 0,
+            title: String::new(),
+            title_seq: 0,
+            pending_clipboard: None,
+            active_link: None,
+            hyperlinks: std::collections::HashMap::new(),
+            combining_pool: vec![Vec::new()], // index 0 = empty sentinel
+            combining_index: std::collections::HashMap::new(),
+            pending_log: Vec::new(),
+            view_offset: 0,
         }
+    }
+
+    /// Intern a combining sequence and return its `combining_id`. Empty
+    /// sequences map to 0. The pool grows monotonically; pool entries become
+    /// unreferenced when their cells are overwritten (bounded leak).
+    fn intern_combining(&mut self, marks: Vec<char>) -> u16 {
+        if marks.is_empty() {
+            return 0;
+        }
+        if let Some(id) = self.combining_index.get(&marks) {
+            return *id;
+        }
+        let id = self.combining_pool.len().min(u16::MAX as usize) as u16;
+        if id == u16::MAX {
+            // Pool exhausted; degrade gracefully (drop the combining mark).
+            return 0;
+        }
+        self.combining_pool.push(marks.clone());
+        self.combining_index.insert(marks, id);
+        id
+    }
+
+    /// Concatenate a cell's base codepoint with its combining marks (if any).
+    pub fn cluster_string(&self, cell: &Cell) -> String {
+        if cell.combining_id == 0 {
+            return cell.c.to_string();
+        }
+        let mut s = String::with_capacity(4);
+        s.push(cell.c);
+        if let Some(extras) = self.combining_pool.get(cell.combining_id as usize) {
+            for &c in extras {
+                s.push(c);
+            }
+        }
+        s
+    }
+
+    /// Attach a zero-width codepoint to the cell at the previous cursor
+    /// position. No-op if the cursor is at the start of a row.
+    pub fn attach_combining(&mut self, cursor: &CursorState, c: char) {
+        if cursor.col == 0 {
+            return;
+        }
+        // Find the visible (non wide-trailing) cell to attach to.
+        let mut col = cursor.col - 1;
+        let row = cursor.row;
+        loop {
+            let idx = self.index(col, row);
+            let cur_id = self.viewport[idx].combining_id;
+            if self.viewport[idx].flags & ATTR_WIDE_TRAILING != 0 && col > 0 {
+                col -= 1;
+                continue;
+            }
+            let mut extras: Vec<char> = self
+                .combining_pool
+                .get(cur_id as usize)
+                .cloned()
+                .unwrap_or_default();
+            extras.push(c);
+            let new_id = self.intern_combining(extras);
+            self.viewport[idx].combining_id = new_id;
+            return;
+        }
+    }
+
+    /// Place a width-2 character spanning two adjacent cells. Wraps at the
+    /// right edge if autowrap is on; clamps and overwrites otherwise.
+    pub fn write_wide(&mut self, cursor: &mut CursorState, c: char) {
+        if cursor.col + 2 > self.cols {
+            if self.autowrap {
+                cursor.col = 0;
+                self.line_feed(cursor);
+                if cursor.col + 2 > self.cols {
+                    return; // viewport too narrow for any wide char
+                }
+            } else {
+                cursor.col = self.cols.saturating_sub(2);
+            }
+        }
+        let row = cursor.row;
+        let lead_idx = self.index(cursor.col, row);
+        let trail_idx = self.index(cursor.col + 1, row);
+        let mut lead = cursor.pen;
+        lead.c = c;
+        lead.flags |= ATTR_WIDE;
+        let mut trail = cursor.pen;
+        trail.c = ' ';
+        trail.flags |= ATTR_WIDE_TRAILING;
+        self.viewport[lead_idx] = lead;
+        self.viewport[trail_idx] = trail;
+        if !self.alt_active {
+            if let Some(url) = &self.active_link {
+                let abs_row = self.scrollback.len() + row;
+                self.hyperlinks.insert((abs_row, cursor.col), url.clone());
+            }
+        }
+        cursor.col += 2;
+    }
+
+    /// Called from the parser on BEL (`0x07`); increments the counter the
+    /// orchestrator watches to fire the visual bell.
+    pub fn ring_bell(&mut self) {
+        self.bell_seq = self.bell_seq.wrapping_add(1);
     }
 
     /// Translates 2D coordinate to 1D index.
@@ -137,9 +368,170 @@ impl Grid {
         self.rows
     }
 
+    /// Raw viewport slice. Renderers now use `display_row` (scrollback-aware);
+    /// kept public for the spec-defined Grid surface and grid-internal tests.
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn viewport(&self) -> &[Cell] {
         &self.viewport
+    }
+
+    /// Absolute row index of viewport row 0 (== `scrollback.len()`).
+    #[inline(always)]
+    pub fn viewport_first_abs_row(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    #[inline(always)]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// `true` while a child app is on the alternate screen (vim, htop, ...).
+    #[inline(always)]
+    pub fn is_alt(&self) -> bool {
+        self.alt_active
+    }
+
+    /// Scroll the live view up (positive delta) or down (negative). No-op when
+    /// the alternate screen is active (vim/htop own scrolling there).
+    pub fn scroll_lines(&mut self, delta: isize) {
+        if self.alt_active {
+            return;
+        }
+        let cur = self.view_offset as isize + delta;
+        let max = self.scrollback.len() as isize;
+        self.view_offset = cur.clamp(0, max) as usize;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        if !self.alt_active {
+            self.view_offset = self.scrollback.len();
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.view_offset = 0;
+    }
+
+    /// Are we showing the live viewport (the bottom) right now?
+    #[inline(always)]
+    pub fn at_bottom(&self) -> bool {
+        self.view_offset == 0
+    }
+
+    /// Return cells for displayed row `y` (0 = top of view). When
+    /// `view_offset > 0`, the topmost rows come from scrollback.
+    pub fn display_row(&self, y: usize) -> &[Cell] {
+        let cols = self.cols;
+        if y >= self.rows {
+            return &self.viewport[0..0];
+        }
+        // Absolute row currently shown at viewport row 0.
+        let top_abs = self.viewport_first_abs_row().saturating_sub(self.view_offset);
+        let abs_row = top_abs + y;
+        let vp_top = self.viewport_first_abs_row();
+        if abs_row < vp_top {
+            // Scrollback row.
+            self.scrollback
+                .get(abs_row)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        } else {
+            let vy = abs_row - vp_top;
+            if vy < self.rows {
+                let base = vy * cols;
+                &self.viewport[base..base + cols]
+            } else {
+                &[]
+            }
+        }
+    }
+
+    /// Append a line to scrollback without recording it in `pending_log`
+    /// (used by cross-session restore so we don't re-log restored history).
+    pub fn push_history_line(&mut self, mut line: Vec<Cell>) {
+        if self.max_scrollback == 0 {
+            return;
+        }
+        // Pad/truncate to current grid width.
+        line.resize(self.cols, Cell::default());
+        if self.scrollback.len() == self.max_scrollback {
+            self.scrollback.pop_front();
+        }
+        self.scrollback.push_back(line);
+    }
+
+    /// Return the text of an absolute row as a String (cells joined, trailing
+    /// spaces preserved). Used for URL detection at click sites.
+    pub fn row_text(&self, abs_row: usize) -> String {
+        let cols = self.cols;
+        let top = self.viewport_first_abs_row();
+        if abs_row < top {
+            match self.scrollback.get(abs_row) {
+                Some(cells) => cells.iter().map(|c| c.c).collect(),
+                None => String::new(),
+            }
+        } else {
+            let vy = abs_row - top;
+            if vy < self.rows {
+                let base = vy * cols;
+                self.viewport[base..base + cols].iter().map(|c| c.c).collect()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    /// Extract selection text in reading order. Each row is trimmed of trailing
+    /// spaces (DECAWM wrap-tracking is a deferred refinement). Rows are joined
+    /// with '\n'. Out-of-bounds rows yield empty contributions.
+    pub fn get_selection_text(&self, sel: Selection) -> String {
+        let (start, end) = sel.normalized();
+        let top = self.viewport_first_abs_row();
+        let cols = self.cols;
+        let mut out = String::new();
+        for abs_row in start.abs_row..=end.abs_row {
+            let row_cells: Option<&[Cell]> = if abs_row < top {
+                self.scrollback.get(abs_row).map(|v| v.as_slice())
+            } else {
+                let vy = abs_row - top;
+                if vy < self.rows {
+                    let base = vy * cols;
+                    Some(&self.viewport[base..base + cols])
+                } else {
+                    None
+                }
+            };
+
+            let col_start = if abs_row == start.abs_row { start.col } else { 0 };
+            // Inclusive end column, clamped.
+            let col_end_excl = if abs_row == end.abs_row {
+                (end.col + 1).min(cols)
+            } else {
+                cols
+            };
+
+            let mut line = String::new();
+            if let Some(cells) = row_cells {
+                if col_start < col_end_excl {
+                    for cell in &cells[col_start..col_end_excl] {
+                        if cell.flags & ATTR_WIDE_TRAILING != 0 {
+                            continue; // glyph belongs to the leading cell
+                        }
+                        line.push_str(&self.cluster_string(cell));
+                    }
+                }
+            }
+            // Trim trailing spaces from this row only.
+            let trimmed_len = line.trim_end_matches(' ').len();
+            line.truncate(trimmed_len);
+            out.push_str(&line);
+            if abs_row != end.abs_row {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Standard printable character insertion with right-edge wrap.
@@ -157,6 +549,13 @@ impl Grid {
         let mut cell = cursor.pen;
         cell.c = c;
         self.viewport[idx] = cell;
+        // Record OSC 8 hyperlink for this cell (primary screen only).
+        if !self.alt_active {
+            if let Some(url) = &self.active_link {
+                let abs_row = self.scrollback.len() + cursor.row;
+                self.hyperlinks.insert((abs_row, cursor.col), url.clone());
+            }
+        }
         cursor.col += 1;
     }
 
@@ -187,6 +586,9 @@ impl Grid {
         }
         if !self.alt_active && top == 0 && bot == self.rows - 1 && self.max_scrollback > 0 {
             let line0: Vec<Cell> = self.viewport[0..self.cols].to_vec();
+            // Tee the about-to-scroll line to the orchestrator for plain-text
+            // session logging. The clone is bounded by max_scrollback growth.
+            self.pending_log.push(line0.clone());
             if self.scrollback.len() == self.max_scrollback {
                 self.scrollback.pop_front();
             }
@@ -275,6 +677,8 @@ impl Grid {
         self.alt_active = true;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        // Alt screen has no scrollback semantics; snap the view to the bottom.
+        self.view_offset = 0;
     }
 
     /// Leave the alternate screen, restoring the primary buffer.
@@ -436,18 +840,34 @@ impl Grid {
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
         self.saved_primary = None;
+        // View offset can't outlive scrollback after a resize-driven trim.
+        self.view_offset = self.view_offset.min(self.scrollback.len());
         cursor.row = cursor.row.min(rows.saturating_sub(1));
         cursor.col = cursor.col.min(cols.saturating_sub(1));
     }
 }
 
-/// Map the 16 ANSI palette indices to 0x00RRGGBB.
+/// The 16-color ANSI palette (`0x00RRGGBB`). Exposed so renderers can
+/// implement "bold-as-bright" (palette[i] -> palette[i+8] for i in 0..=7).
+pub const ANSI_PALETTE: [u32; 16] = [
+    0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+    0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+];
+
+/// If `fg` is one of the first 8 palette colors, return its bright counterpart.
+/// Else return `fg` unchanged. Used at render time when `ATTR_BOLD` is set
+/// (this is the conventional "bold = bright" terminal behavior).
+pub fn brighten_palette_color(fg: u32) -> u32 {
+    for i in 0..8 {
+        if ANSI_PALETTE[i] == fg {
+            return ANSI_PALETTE[i + 8];
+        }
+    }
+    fg
+}
+
 fn ansi_16(i: u16) -> u32 {
-    const PALETTE: [u32; 16] = [
-        0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
-        0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-    ];
-    PALETTE[(i as usize) & 0xF]
+    ANSI_PALETTE[(i as usize) & 0xF]
 }
 
 /// Consume the tail of an SGR 38/48 sequence: `;2;r;g;b` truecolor or `;5;n` 256-color.
