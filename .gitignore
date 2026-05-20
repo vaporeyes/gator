@@ -1,0 +1,21 @@
+# Cargo build artifacts.
+/target/
+
+# Cargo.lock is intentionally committed (this is a binary crate).
+
+# Editor / IDE.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS.
+.DS_Store
+
+# Profiling / crash dumps.
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+flamegraph.svg

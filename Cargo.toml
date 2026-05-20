@@ -1,0 +1,23 @@
+# ABOUTME: Cargo manifest for gaterminal, a PTY-backed terminal emulator.
+# ABOUTME: Pins the async runtime, PTY backend, ANSI parser, and TUI renderer.
+[package]
+name = "gaterminal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+portable-pty = "0.8"
+vte = "0.13"
+crossterm = "0.27"
+thiserror = "1"
+anyhow = "1"
+# GPU windowed renderer (default binary path; --tui keeps the crossterm path).
+winit = "0.29"
+wgpu = "0.20"
+cosmic-text = "0.12"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
