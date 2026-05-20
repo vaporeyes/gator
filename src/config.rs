@@ -1,4 +1,4 @@
-// ABOUTME: TOML configuration: shell, scrollback, font, colors, window size.
+// ABOUTME: TOML configuration: shell, scrollback, font, colors, window/chrome size.
 // ABOUTME: Missing file = defaults; present-but-invalid = hard error.
 
 use serde::Deserialize;
@@ -39,13 +39,19 @@ impl Default for Config {
 pub struct ChromeConfig {
     /// Flash the screen briefly when the app rings the bell (BEL = 0x07).
     pub visual_bell: bool,
+    /// Show the Gator icon in native window chrome where the platform allows.
+    pub titlebar_icon: bool,
     /// Padding (logical px) between the window edge and the cell grid.
     pub padding: u32,
 }
 
 impl Default for ChromeConfig {
     fn default() -> Self {
-        Self { visual_bell: true, padding: 0 }
+        Self {
+            visual_bell: true,
+            titlebar_icon: true,
+            padding: 0,
+        }
     }
 }
 
@@ -139,8 +145,8 @@ pub struct ColorConfig {
 impl Default for ColorConfig {
     fn default() -> Self {
         Self {
-            foreground: HexColor(0xFFFFFF),
-            background: HexColor(0x000000),
+            foreground: HexColor(0xDDE6B8),
+            background: HexColor(0x08110B),
             bold_is_bright: true,
         }
     }
@@ -194,7 +200,7 @@ impl Config {
     /// Resolve and load. Explicit path wins; then XDG/HOME defaults.
     /// A missing file yields defaults; an unparseable file is an error.
     pub fn load(explicit: Option<PathBuf>) -> anyhow::Result<Self> {
-        let path = explicit.or_else(default_path);
+        let path = explicit.or_else(default_existing_path);
         match path {
             Some(p) if p.exists() => {
                 let text = std::fs::read_to_string(&p)?;
@@ -206,15 +212,36 @@ impl Config {
     }
 }
 
-fn default_path() -> Option<PathBuf> {
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
-            return Some(PathBuf::from(x).join("gaterminal/config.toml"));
+fn default_existing_path() -> Option<PathBuf> {
+    default_existing_path_from_env(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn default_existing_path_from_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    config_path_for_app_from_env("gator", xdg_config_home, home)
+        .filter(|p| p.exists())
+        .or_else(|| {
+            config_path_for_app_from_env("gaterminal", xdg_config_home, home)
+                .filter(|p| p.exists())
+        })
+}
+
+fn config_path_for_app_from_env(
+    app: &str,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join(app).join("config.toml"));
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config/gaterminal/config.toml"))
+    home.map(|h| PathBuf::from(h).join(".config").join(app).join("config.toml"))
 }
 
 #[cfg(test)]
@@ -226,9 +253,10 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.scrollback, 10_000);
         assert_eq!(c.font.size, 18.0);
-        assert_eq!(c.colors.foreground.0, 0xFFFFFF);
-        assert_eq!(c.colors.background.0, 0x000000);
+        assert_eq!(c.colors.foreground.0, 0xDDE6B8);
+        assert_eq!(c.colors.background.0, 0x08110B);
         assert_eq!((c.window.width, c.window.height), (960, 600));
+        assert!(c.chrome.titlebar_icon);
         assert!(c.shell.is_none());
     }
 
@@ -247,7 +275,7 @@ mod tests {
         assert_eq!(c.scrollback, 500);
         assert_eq!(c.colors.background.0, 0x102030);
         // Untouched fields fall back to defaults.
-        assert_eq!(c.colors.foreground.0, 0xFFFFFF);
+        assert_eq!(c.colors.foreground.0, 0xDDE6B8);
         assert_eq!(c.window.width, 1280);
         assert_eq!(c.window.height, 600);
     }
@@ -290,6 +318,42 @@ mod tests {
     }
 
     #[test]
+    fn app_config_paths_use_current_and_legacy_names() {
+        assert_eq!(
+            config_path_for_app_from_env("gator", None, Some("/tmp/home")).unwrap(),
+            PathBuf::from("/tmp/home/.config/gator/config.toml")
+        );
+        assert_eq!(
+            config_path_for_app_from_env("gaterminal", None, Some("/tmp/home")).unwrap(),
+            PathBuf::from("/tmp/home/.config/gaterminal/config.toml")
+        );
+        assert_eq!(
+            config_path_for_app_from_env("gator", Some("/tmp/xdg"), Some("/tmp/home")).unwrap(),
+            PathBuf::from("/tmp/xdg/gator/config.toml")
+        );
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_existing_legacy_file() {
+        let root = std::env::temp_dir().join(format!(
+            "gator-config-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy_dir = root.join(".config").join("gaterminal");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("config.toml");
+        std::fs::write(&legacy_path, "scrollback = 123\n").unwrap();
+
+        assert_eq!(
+            default_existing_path_from_env(None, root.to_str()).unwrap(),
+            legacy_path
+        );
+    }
+
+    #[test]
     fn effects_default_off_and_parse() {
         let c = Config::default();
         assert!(!c.effects.any());
@@ -304,6 +368,22 @@ mod tests {
         assert!(c.effects.crt && c.effects.keystroke);
         assert!(!c.effects.wobble && !c.effects.cube);
         assert!(c.effects.any());
+    }
+
+    #[test]
+    fn chrome_block_parses() {
+        let c: Config = toml::from_str(
+            r#"
+            [chrome]
+            visual_bell = false
+            titlebar_icon = false
+            padding = 8
+            "#,
+        )
+        .unwrap();
+        assert!(!c.chrome.visual_bell);
+        assert!(!c.chrome.titlebar_icon);
+        assert_eq!(c.chrome.padding, 8);
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl PortablePty {
             .openpty(pty_size(rows, cols))
             .map_err(|e| PtyError::Spawn(e.to_string()))?;
 
-        let cmd = CommandBuilder::new(shell);
+        let cmd = command_for_shell(shell);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -137,6 +137,14 @@ impl PortablePty {
             PtyControl { master: self.master, writer: self.writer, child: self.child },
         )
     }
+}
+
+fn command_for_shell(shell: &str) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("GATOR", "1");
+    cmd
 }
 
 impl PtyReader {
@@ -217,3 +225,16 @@ impl PtyBackend for PortablePty {
 // Note: no Drop for PortablePty. The orchestrator always splits it; child
 // teardown lives on PtyControl::drop. A Drop here would also block into_split
 // from moving fields out (E0509).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_sets_terminal_capability_environment() {
+        let cmd = command_for_shell("/bin/sh");
+        assert_eq!(cmd.get_env("TERM").and_then(|s| s.to_str()), Some("xterm-256color"));
+        assert_eq!(cmd.get_env("COLORTERM").and_then(|s| s.to_str()), Some("truecolor"));
+        assert_eq!(cmd.get_env("GATOR").and_then(|s| s.to_str()), Some("1"));
+    }
+}

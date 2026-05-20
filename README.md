@@ -1,6 +1,10 @@
-# gaterminal
+<p align="center">
+  <img src="assets/gator-logo.svg" alt="Gator terminal logo" width="180">
+</p>
 
-A PTY-backed terminal emulator written in Rust. Ships two interchangeable backends behind a single `Renderer` trait:
+# gator
+
+A PTY-backed terminal emulator written in Rust, with a quiet alligator-inspired default palette. Ships two interchangeable backends behind a single `Renderer` trait:
 
 - **GPU** (default): a native window via `winit` + `wgpu` with a `cosmic-text` glyph atlas and a single instanced quad pass per frame. HiDPI-aware.
 - **TUI** (`--tui`): a terminal-in-a-terminal via `crossterm`, with dirty-cell `FrameDiff` rendering.
@@ -14,7 +18,7 @@ cargo build
 cargo run                 # GPU windowed terminal (default)
 cargo run -- --tui        # crossterm fallback (runs inside your current terminal)
 cargo run -- --config /path/to/config.toml
-cargo test                # 39 unit tests
+cargo test                # 63 unit tests
 ```
 
 Requires a Rust toolchain that supports edition 2021. `Cargo.lock` is committed (this is a binary crate).
@@ -46,14 +50,14 @@ The crate is laid out in four conceptual phases, mirroring `spec.md`:
 
 ## Configuration
 
-Resolution order: `--config <path>` > `$XDG_CONFIG_HOME/gaterminal/config.toml` > `~/.config/gaterminal/config.toml`. A missing file silently uses defaults; a present-but-invalid file is a hard error with the offending path.
+Resolution order: `--config <path>` > `$XDG_CONFIG_HOME/gator/config.toml` > `~/.config/gator/config.toml`. If the new path is absent, Gator also checks the old `gaterminal` config path for compatibility. A missing file silently uses defaults; a present-but-invalid file is a hard error with the offending path.
 
 `serde(deny_unknown_fields)` is set on every section: typos error out instead of being silently ignored.
 
 ### Full example
 
 ```toml
-# ~/.config/gaterminal/config.toml
+# ~/.config/gator/config.toml
 
 # Override $SHELL. If absent, $SHELL is used, then /bin/sh.
 shell = "/opt/homebrew/bin/fish"
@@ -72,22 +76,31 @@ path = "/System/Library/Fonts/Menlo.ttc"
 [colors]
 # `#rgb` or `#rrggbb`. These map the "default fg/bg" sentinels at render time
 # (SGR reset / 39 / 49 produce them); no grid mutation needed.
-foreground = "#e0e0e0"
-background = "#1a1b26"
+foreground = "#dde6b8"
+background = "#08110b"
 
 [window]
 # Initial logical (pre-DPI) size of the GPU window.
 width  = 1280
 height = 800
 
+[chrome]
+# Show the Gator icon in native window chrome where supported.
+# macOS does not expose a stable per-window titlebar icon through winit.
+titlebar_icon = true
+# Flash the screen briefly on BEL.
+visual_bell = true
+# Padding (logical px) between the window edge and the cell grid.
+padding = 0
+
 [session]
 # Raw byte-for-byte session log, one file per launch. Empty = off.
 # `~` expands to $HOME. `{ts}` expands to unix seconds.
-raw_log = "~/.local/share/gaterminal/sessions/{ts}.raw"
+raw_log = "~/.local/share/gator/sessions/{ts}.raw"
 
 # Plain-text scrollback log (append). Each line is written as it scrolls out
 # of the viewport into scrollback. Trailing spaces are stripped. Empty = off.
-text_log = "~/.local/share/gaterminal/history.log"
+text_log = "~/.local/share/gator/history.log"
 
 # On startup, preload this many lines from `text_log` into the scrollback
 # ring so PageUp shows yesterday's session. 0 = no restore.
@@ -104,9 +117,12 @@ restore_lines = 2000
 | `font.size` | `18.0` |
 | `font.line_height` | `1.3` |
 | `font.path` | unset (resolves via fontdb) |
-| `colors.foreground` | `#ffffff` |
-| `colors.background` | `#000000` |
+| `colors.foreground` | `#dde6b8` |
+| `colors.background` | `#08110b` |
 | `window.width` / `window.height` | `960` / `600` |
+| `chrome.titlebar_icon` | `true` |
+| `chrome.visual_bell` | `true` |
+| `chrome.padding` | `0` |
 | `session.raw_log` | `""` (off) |
 | `session.text_log` | `""` (off) |
 | `session.restore_lines` | `0` |
@@ -187,7 +203,7 @@ The standard "is it OK?" loop:
 ```sh
 cargo build                  # 0 errors, 0 warnings is the bar
 cargo test                   # must stay green
-timeout 8 ./target/debug/gaterminal < /dev/null   # GPU smoke: exit 0/124 with no stderr
+timeout 8 ./target/debug/gator < /dev/null   # GPU smoke: exit 0/124 with no stderr
 ```
 
 The GPU binary cannot be visually verified from headless CI. Local visual checks are required for: glyph metrics tuning, selection inversion, scrollback view, clipboard interaction, and any color/theme changes.

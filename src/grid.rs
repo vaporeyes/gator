@@ -105,14 +105,6 @@ impl CursorState {
         }
     }
 
-    /// CSI H / CSI f: parameters are 1-based (row;col); absence means 1.
-    pub fn move_to(&mut self, params: &Params) {
-        let mut it = params.iter();
-        let row = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-        let col = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-        self.row = row.max(1) as usize - 1;
-        self.col = col.max(1) as usize - 1;
-    }
 }
 
 pub struct Grid {
@@ -382,6 +374,12 @@ impl Grid {
         self.scrollback.len()
     }
 
+    /// Absolute row index currently displayed at viewport row `y`.
+    #[inline(always)]
+    pub fn displayed_abs_row(&self, y: usize) -> usize {
+        self.viewport_first_abs_row().saturating_sub(self.view_offset) + y
+    }
+
     #[inline(always)]
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
@@ -428,8 +426,7 @@ impl Grid {
             return &self.viewport[0..0];
         }
         // Absolute row currently shown at viewport row 0.
-        let top_abs = self.viewport_first_abs_row().saturating_sub(self.view_offset);
-        let abs_row = top_abs + y;
+        let abs_row = self.displayed_abs_row(y);
         let vp_top = self.viewport_first_abs_row();
         if abs_row < vp_top {
             // Scrollback row.
@@ -757,6 +754,15 @@ impl Grid {
         cursor.row = (row_1based.max(1) - 1).min(self.rows.saturating_sub(1));
     }
 
+    /// CSI H / CSI f: set row and column together, clamped to the screen.
+    pub fn move_to(&self, cursor: &mut CursorState, params: &Params) {
+        let mut it = params.iter();
+        let row = it.next().and_then(|p| p.first().copied()).unwrap_or(1) as usize;
+        let col = it.next().and_then(|p| p.first().copied()).unwrap_or(1) as usize;
+        cursor.row = row.max(1).saturating_sub(1).min(self.rows.saturating_sub(1));
+        cursor.col = col.max(1).saturating_sub(1).min(self.cols.saturating_sub(1));
+    }
+
     /// CSI A/B/C/D: relative cursor move, clamped (no scroll, no wrap).
     pub fn move_rel(&self, cursor: &mut CursorState, dcol: isize, drow: isize) {
         let col = cursor.col as isize + dcol;
@@ -824,27 +830,39 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        let mut next = vec![Cell::default(); cols * rows];
-        let copy_rows = rows.min(self.rows);
-        let copy_cols = cols.min(self.cols);
-        for y in 0..copy_rows {
-            for x in 0..copy_cols {
-                next[y * cols + x] = self.viewport[y * self.cols + x];
-            }
+        self.viewport = resize_cells(&self.viewport, self.cols, self.rows, cols, rows);
+        if let Some(primary) = self.saved_primary.take() {
+            self.saved_primary = Some(resize_cells(&primary, self.cols, self.rows, cols, rows));
         }
-        self.viewport = next;
         self.cols = cols;
         self.rows = rows;
         // Scroll region and the stashed alt-primary are sized to the old
-        // geometry; reset them rather than index out of bounds.
+        // geometry; reset the region rather than index out of bounds.
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
-        self.saved_primary = None;
         // View offset can't outlive scrollback after a resize-driven trim.
         self.view_offset = self.view_offset.min(self.scrollback.len());
         cursor.row = cursor.row.min(rows.saturating_sub(1));
         cursor.col = cursor.col.min(cols.saturating_sub(1));
     }
+}
+
+fn resize_cells(
+    cells: &[Cell],
+    old_cols: usize,
+    old_rows: usize,
+    new_cols: usize,
+    new_rows: usize,
+) -> Vec<Cell> {
+    let mut next = vec![Cell::default(); new_cols * new_rows];
+    let copy_rows = new_rows.min(old_rows);
+    let copy_cols = new_cols.min(old_cols);
+    for y in 0..copy_rows {
+        for x in 0..copy_cols {
+            next[y * new_cols + x] = cells[y * old_cols + x];
+        }
+    }
+    next
 }
 
 /// The 16-color ANSI palette (`0x00RRGGBB`). Exposed so renderers can

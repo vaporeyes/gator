@@ -57,7 +57,7 @@ impl<'a> Perform for StateMutator<'a> {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         match action {
             'm' => self.grid.update_attributes(self.cursor, params), // SGR
-            'H' | 'f' => self.cursor.move_to(params),                // Cursor Position
+            'H' | 'f' => self.grid.move_to(self.cursor, params),      // Cursor Position
             'A' => self.grid.move_rel(self.cursor, 0, -(param1(params, 1) as isize)),
             'B' => self.grid.move_rel(self.cursor, 0, param1(params, 1) as isize),
             'C' => self.grid.move_rel(self.cursor, param1(params, 1) as isize, 0),
@@ -257,6 +257,13 @@ mod tests {
     }
 
     #[test]
+    fn cup_clamps_to_screen_bounds() {
+        let (g, c) = drive(4, 2, b"\x1b[999;999HX");
+        assert_eq!((c.row, c.col), (1, 4));
+        assert_eq!(screen(&g)[1], "   X");
+    }
+
+    #[test]
     fn dsr_device_status_ok() {
         let (resp, _) = run(b"\x1b[5n");
         assert_eq!(resp, b"\x1b[0n");
@@ -361,6 +368,14 @@ mod tests {
         assert_eq!(screen(&g)[0], "hi");
         // ?1049 restores the saved cursor too.
         assert_eq!((c.row, c.col), (0, 2));
+    }
+
+    #[test]
+    fn alt_screen_resize_preserves_primary() {
+        let (mut g, mut c) = drive(4, 2, b"hi\x1b[?1049hALT");
+        g.resize(6, 3, &mut c);
+        g.exit_alt_screen();
+        assert_eq!(screen(&g)[0], "hi");
     }
 
     #[test]
@@ -579,6 +594,16 @@ mod tests {
         // Top-of-view row 0 should be scrollback's oldest (AAA).
         let top: String = g.display_row(0).iter().map(|c| c.c).collect();
         assert_eq!(top.trim_end(), "AAA");
+    }
+
+    #[test]
+    fn displayed_abs_row_accounts_for_scrollback_offset() {
+        let (mut g, _) = drive(4, 2, b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        g.scroll_lines(2);
+        assert_eq!(g.displayed_abs_row(0), 0);
+        assert_eq!(g.displayed_abs_row(1), 1);
+        g.scroll_to_bottom();
+        assert_eq!(g.displayed_abs_row(0), g.viewport_first_abs_row());
     }
 
     #[test]

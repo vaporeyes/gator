@@ -1,7 +1,7 @@
-# ABOUTME: Cargo manifest for gaterminal, a PTY-backed terminal emulator.
+# ABOUTME: Cargo manifest for gator, an alligator-themed terminal emulator.
 # ABOUTME: Pins the async runtime, PTY backend, ANSI parser, and TUI renderer.
 [package]
-name = "gaterminal"
+name = "gator"
 version = "0.1.0"
 edition = "2021"
 

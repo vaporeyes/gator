@@ -20,6 +20,8 @@ use winit::event::{
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+#[cfg(not(target_os = "macos"))]
+use winit::window::Icon;
 use winit::window::WindowBuilder;
 
 /// Idle PTY poll cadence. winit gives us no wakeup on PTY data, so we tick.
@@ -27,15 +29,14 @@ const POLL: Duration = Duration::from_millis(5);
 
 pub fn run(shell: String, cfg: Config) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("gaterminal")
-            .with_inner_size(LogicalSize::new(
-                cfg.window.width as f64,
-                cfg.window.height as f64,
-            ))
-            .build(&event_loop)?,
-    );
+    let builder = WindowBuilder::new()
+        .with_title("gator")
+        .with_inner_size(LogicalSize::new(
+            cfg.window.width as f64,
+            cfg.window.height as f64,
+        ));
+    let builder = apply_window_icon(builder, &cfg)?;
+    let window = Arc::new(builder.build(&event_loop)?);
 
     let mut renderer = pollster::block_on(GpuRenderer::new(window.clone(), &cfg))?;
     let (mut cols, mut rows) = renderer.grid_dims();
@@ -271,9 +272,7 @@ pub fn run(shell: String, cfg: Config) -> anyhow::Result<()> {
                     && btn == MouseButton::Left
                     && (mods.super_key() || mods.control_key())
                 {
-                    let abs_row = grid.viewport_first_abs_row()
-                        .saturating_sub(grid.view_offset)
-                        + row;
+                    let abs_row = grid.displayed_abs_row(row);
                     let link = grid
                         .hyperlinks
                         .get(&(abs_row, col))
@@ -418,6 +417,135 @@ pub fn run(shell: String, cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn apply_window_icon(mut builder: WindowBuilder, cfg: &Config) -> anyhow::Result<WindowBuilder> {
+    if cfg.chrome.titlebar_icon {
+        builder = builder.with_window_icon(Some(gator_window_icon()?));
+    }
+    Ok(builder)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_window_icon(builder: WindowBuilder, _cfg: &Config) -> anyhow::Result<WindowBuilder> {
+    Ok(builder)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gator_window_icon() -> anyhow::Result<Icon> {
+    const SIZE: u32 = 64;
+    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
+
+    fill_rounded_rect(&mut rgba, SIZE, 6, 6, 52, 52, 10, [8, 17, 11, 255]);
+    fill_rounded_rect(&mut rgba, SIZE, 12, 18, 40, 34, 6, [12, 26, 16, 255]);
+    fill_rect(&mut rgba, SIZE, 12, 18, 40, 6, [20, 40, 26, 255]);
+    fill_rect(&mut rgba, SIZE, 16, 35, 30, 4, [221, 230, 184, 255]);
+    fill_rect(&mut rgba, SIZE, 16, 35, 12, 4, [143, 191, 90, 255]);
+    draw_prompt(&mut rgba, SIZE);
+    draw_gator_ridge(&mut rgba, SIZE);
+    fill_rect(&mut rgba, SIZE, 28, 45, 16, 4, [211, 180, 92, 255]);
+
+    Icon::from_rgba(rgba, SIZE, SIZE).map_err(Into::into)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn draw_prompt(rgba: &mut [u8], size: u32) {
+    for i in 0..12 {
+        fill_rect(rgba, size, 18 + i, 28 + i / 2, 2, 3, [221, 230, 184, 255]);
+        fill_rect(rgba, size, 29 - i, 34 + i / 2, 2, 3, [221, 230, 184, 255]);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn draw_gator_ridge(rgba: &mut [u8], size: u32) {
+    let points = [(18, 28), (24, 24), (31, 29), (38, 24), (46, 29)];
+    for pair in points.windows(2) {
+        draw_line(rgba, size, pair[0], pair[1], [143, 191, 90, 255]);
+    }
+    fill_rect(rgba, size, 40, 27, 2, 2, [8, 17, 11, 255]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn draw_line(rgba: &mut [u8], size: u32, from: (u32, u32), to: (u32, u32), color: [u8; 4]) {
+    let (mut x0, mut y0) = (from.0 as i32, from.1 as i32);
+    let (x1, y1) = (to.0 as i32, to.1 as i32);
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        fill_rect(rgba, size, x0 as u32, y0 as u32, 3, 3, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fill_rounded_rect(
+    rgba: &mut [u8],
+    size: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    color: [u8; 4],
+) {
+    let right = x + w - 1;
+    let bottom = y + h - 1;
+    for py in y..=bottom {
+        for px in x..=right {
+            let cx = if px < x + radius {
+                x + radius
+            } else if px > right - radius {
+                right - radius
+            } else {
+                px
+            };
+            let cy = if py < y + radius {
+                y + radius
+            } else if py > bottom - radius {
+                bottom - radius
+            } else {
+                py
+            };
+            let dx = px as i32 - cx as i32;
+            let dy = py as i32 - cy as i32;
+            if dx * dx + dy * dy <= (radius as i32) * (radius as i32) {
+                set_pixel(rgba, size, px, py, color);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fill_rect(rgba: &mut [u8], size: u32, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+    for py in y..y + h {
+        for px in x..x + w {
+            set_pixel(rgba, size, px, py, color);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_pixel(rgba: &mut [u8], size: u32, x: u32, y: u32, color: [u8; 4]) {
+    if x >= size || y >= size {
+        return;
+    }
+    let idx = ((y * size + x) * 4) as usize;
+    rgba[idx..idx + 4].copy_from_slice(&color);
+}
+
 /// Translate a winit logical key into the bytes a PTY expects.
 fn encode_key(key: &Key, ctrl: bool) -> Option<Vec<u8>> {
     match key {
@@ -499,7 +627,7 @@ fn dispatch_mouse(
     if button != MouseButton::Left {
         return;
     }
-    let abs = AbsCoord { abs_row: grid.viewport_first_abs_row() + row, col };
+    let abs = AbsCoord { abs_row: grid.displayed_abs_row(row), col };
     match action {
         MouseAction::Press => grid.selection = Some(Selection::new(abs)),
         MouseAction::Drag => {

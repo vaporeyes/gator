@@ -53,6 +53,13 @@ struct GlyphKey {
     italic: bool,
 }
 
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+struct CharGlyphKey {
+    c: char,
+    bold: bool,
+    italic: bool,
+}
+
 #[derive(Clone, Copy)]
 struct GlyphInfo {
     uv: [f32; 4],
@@ -88,7 +95,12 @@ pub struct GpuRenderer {
 
     font_system: FontSystem,
     swash: SwashCache,
+    char_glyphs: HashMap<CharGlyphKey, Option<GlyphInfo>>,
     glyphs: HashMap<GlyphKey, Option<GlyphInfo>>,
+    bg_instances: Vec<QuadInstance>,
+    fg_instances: Vec<QuadInstance>,
+    instance_buf: wgpu::Buffer,
+    instance_capacity: usize,
 
     /// Logical font size (pt) and line-height factor from config.
     font_pt: f32,
@@ -343,6 +355,13 @@ impl GpuRenderer {
             contents: bytemuck::cast_slice(&[0u16, 1, 2, 2, 1, 3]),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let instance_capacity = 1usize;
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instances"),
+            size: std::mem::size_of::<QuadInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // ---- Two-pass effect pipeline ----
         let offscreen = OffscreenTarget::new(&device, format, w, h);
@@ -445,7 +464,12 @@ impl GpuRenderer {
             atlas,
             font_system,
             swash,
+            char_glyphs: HashMap::new(),
             glyphs: HashMap::new(),
+            bg_instances: Vec::new(),
+            fg_instances: Vec::new(),
+            instance_buf,
+            instance_capacity,
             font_pt,
             font_pt_default: font_pt,
             line_factor,
@@ -519,6 +543,7 @@ impl GpuRenderer {
         self.cell_w = cw;
         self.cell_h = ch;
         self.ascent = asc;
+        self.char_glyphs.clear();
         self.glyphs.clear();
         self.atlas.reset(&self.queue);
     }
@@ -543,8 +568,22 @@ impl GpuRenderer {
         self.cell_w = cw;
         self.cell_h = ch;
         self.ascent = asc;
+        self.char_glyphs.clear();
         self.glyphs.clear();
         self.atlas.reset(&self.queue);
+    }
+
+    /// Resolve a single-codepoint glyph without allocating a `String` on
+    /// every cell. This is the overwhelmingly common terminal render path.
+    fn glyph_char(&mut self, key: CharGlyphKey) -> Option<GlyphInfo> {
+        if let Some(cached) = self.char_glyphs.get(&key) {
+            return *cached;
+        }
+        let mut cluster = [0u8; 4];
+        let s = key.c.encode_utf8(&mut cluster);
+        let info = self.rasterize_text(s, key.bold, key.italic);
+        self.char_glyphs.insert(key, info);
+        info
     }
 
     /// Resolve (rasterize + atlas) a glyph, memoized. None = no bitmap (space).
@@ -552,36 +591,42 @@ impl GpuRenderer {
         if let Some(cached) = self.glyphs.get(&key) {
             return *cached;
         }
-        let info = self.rasterize(&key);
+        let info = self.rasterize_text(&key.cluster, key.bold, key.italic);
         self.glyphs.insert(key, info);
         info
     }
 
-    fn rasterize(&mut self, key: &GlyphKey) -> Option<GlyphInfo> {
+    fn rasterize_text(&mut self, text: &str, bold: bool, italic: bool) -> Option<GlyphInfo> {
         // Try monospace first (the natural family for a terminal); if that
         // yields no glyph (codepoint missing from any monospace face we have),
         // retry without the family constraint so fontdb can resolve from any
         // installed font (Nerd Fonts, system emoji, symbol fonts).
-        self.try_rasterize(key, true)
-            .or_else(|| self.try_rasterize(key, false))
+        self.try_rasterize(text, bold, italic, true)
+            .or_else(|| self.try_rasterize(text, bold, italic, false))
     }
 
-    fn try_rasterize(&mut self, key: &GlyphKey, monospace: bool) -> Option<GlyphInfo> {
+    fn try_rasterize(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        monospace: bool,
+    ) -> Option<GlyphInfo> {
         let mut attrs = Attrs::new();
         if monospace {
             attrs = attrs.family(Family::Monospace);
         }
-        if key.bold {
+        if bold {
             attrs = attrs.weight(Weight::BOLD);
         }
-        if key.italic {
+        if italic {
             attrs = attrs.style(Style::Italic);
         }
         let metrics = scaled_metrics(self.font_pt, self.line_factor, self.scale);
         let box_px = metrics.font_size * 4.0;
         let mut buf = TextBuffer::new(&mut self.font_system, metrics);
         buf.set_size(&mut self.font_system, Some(box_px), Some(box_px));
-        buf.set_text(&mut self.font_system, &key.cluster, attrs, Shaping::Advanced);
+        buf.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
         buf.shape_until_scroll(&mut self.font_system, false);
 
         let phys = buf
@@ -624,6 +669,20 @@ impl GpuRenderer {
         })
     }
 
+    fn ensure_instance_capacity(&mut self, needed: usize) {
+        if needed <= self.instance_capacity {
+            return;
+        }
+        let next = needed.next_power_of_two();
+        self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instances"),
+            size: (next * std::mem::size_of::<QuadInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.instance_capacity = next;
+    }
+
     pub fn render(
         &mut self,
         grid: &Grid,
@@ -648,8 +707,10 @@ impl GpuRenderer {
             None
         };
 
-        let mut bg: Vec<QuadInstance> = Vec::new();
-        let mut fg: Vec<QuadInstance> = Vec::new();
+        let mut bg = std::mem::take(&mut self.bg_instances);
+        let mut fg = std::mem::take(&mut self.fg_instances);
+        bg.clear();
+        fg.clear();
 
         for y in 0..rows {
             let row_cells = grid.display_row(y);
@@ -730,21 +791,28 @@ impl GpuRenderer {
                 // Glyph: trailing wide cells contribute nothing; the leading
                 // cell's cosmic-text image already spans both columns.
                 if !is_wide_trail {
-                    let cluster = grid.cluster_string(cell);
-                    let visible = !cluster.is_empty() && cluster != " ";
-                    if visible {
-                        let key = GlyphKey {
+                    let bold = cell.flags & crate::grid::ATTR_BOLD != 0;
+                    let italic = cell.flags & crate::grid::ATTR_ITALIC != 0;
+                    let glyph = if cell.combining_id == 0 {
+                        if cell.c == ' ' {
+                            None
+                        } else {
+                            self.glyph_char(CharGlyphKey { c: cell.c, bold, italic })
+                        }
+                    } else {
+                        let cluster = grid.cluster_string(cell);
+                        self.glyph(GlyphKey {
                             cluster,
                             bold: cell.flags & crate::grid::ATTR_BOLD != 0,
                             italic: cell.flags & crate::grid::ATTR_ITALIC != 0,
-                        };
-                        if let Some(g) = self.glyph(key) {
-                            fg.push(QuadInstance {
-                                rect: [ox + g.left, oy + self.ascent - g.top, g.w, g.h],
-                                uv: g.uv,
-                                color: rgb(fgc),
-                            });
-                        }
+                        })
+                    };
+                    if let Some(g) = glyph {
+                        fg.push(QuadInstance {
+                            rect: [ox + g.left, oy + self.ascent - g.top, g.w, g.h],
+                            uv: g.uv,
+                            color: rgb(fgc),
+                        });
                     }
                 }
             }
@@ -759,7 +827,6 @@ impl GpuRenderer {
 
         // Background quads first, glyphs after, in one instance buffer so the
         // single instanced draw paints glyphs over their cell backgrounds.
-        let bg_count = bg.len() as u32;
         bg.extend_from_slice(&fg);
         let total = bg.len() as u32;
 
@@ -771,44 +838,44 @@ impl GpuRenderer {
                 _pad: [0.0, 0.0],
             }),
         );
-        self.queue
-            .write_buffer(&self.effects_uniform_buf, 0, bytemuck::bytes_of(effects));
+        let effects_active = effects.effect_mask != 0;
+        if effects_active {
+            self.queue
+                .write_buffer(&self.effects_uniform_buf, 0, bytemuck::bytes_of(effects));
+        }
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
+                self.fg_instances = fg;
+                self.bg_instances = bg;
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                self.fg_instances = fg;
+                self.bg_instances = bg;
+                return;
+            }
         };
         let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("instances"),
-            contents: if total == 0 {
-                // Avoid a zero-sized buffer; we just won't draw it.
-                bytemuck::cast_slice(&[QuadInstance {
-                    rect: [0.0; 4],
-                    uv: [0.0; 4],
-                    color: [0.0; 4],
-                }])
-            } else {
-                bytemuck::cast_slice(&bg)
-            },
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        self.ensure_instance_capacity(bg.len().max(1));
+        if total > 0 {
+            self.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&bg));
+        }
 
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
-        // ---- Pass 1: render cells into the offscreen RT. ----
+        // ---- Pass 1: render cells into either the surface or offscreen RT. ----
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cells"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.offscreen.view,
+                    view: if effects_active { &self.offscreen.view } else { &surface_view },
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -828,15 +895,14 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
-                pass.set_vertex_buffer(1, instance_buf.slice(..));
+                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 pass.set_index_buffer(self.quad_ibuf.slice(..), wgpu::IndexFormat::Uint16);
-                let _ = bg_count;
                 pass.draw_indexed(0..6, 0, 0..total);
             }
         }
 
         // ---- Pass 2: post-process the RT onto the surface. ----
-        {
+        if effects_active {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fx"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -861,6 +927,10 @@ impl GpuRenderer {
         self.queue.submit(Some(enc.finish()));
         self.window.pre_present_notify();
         frame.present();
+        fg.clear();
+        bg.clear();
+        self.fg_instances = fg;
+        self.bg_instances = bg;
     }
 
     /// Draw the find-mode overlay strip across the bottom row. The strip
