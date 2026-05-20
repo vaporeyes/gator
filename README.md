@@ -1,8 +1,10 @@
-<p align="center">
+<!-- <p align="center">
   <img src="assets/gator-logo.svg" alt="Gator terminal logo" width="180">
-</p>
+</p> -->
 
 # gator
+
+![gator-asset](assets/gator-terminal.png)
 
 A PTY-backed terminal emulator written in Rust, with a quiet alligator-inspired default palette. Ships two interchangeable backends behind a single `Renderer` trait:
 
@@ -28,7 +30,7 @@ Requires a Rust toolchain that supports edition 2021. `Cargo.lock` is committed 
 Designed so data flows downward: there is exactly one owner of each piece of state and no `Arc<Mutex>` / callback ladders. The orchestrator (`main.rs` for TUI, `app.rs` for GPU) holds `Grid` + `CursorState` + the vte `Parser`; everything else borrows.
 
 | File | Role |
-|---|---|
+| - | - |
 | `main.rs` | Arg parsing, config load, branches to GPU (default) or TUI orchestrator |
 | `app.rs` | GPU app: winit event loop, mouse/keyboard handling, selection, clipboard, scroll |
 | `ansi.rs` | `StateMutator` implements `vte::Perform` → Grid mutations and PTY query replies |
